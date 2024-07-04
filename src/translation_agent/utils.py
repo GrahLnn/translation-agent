@@ -1,73 +1,193 @@
+import json
 import os
+import shutil
+import sys
+import time
+from datetime import datetime
+from datetime import timedelta
+from datetime import timezone
 from typing import List
-from typing import Union
 
-import openai
+import requests
 import tiktoken
 from dotenv import load_dotenv
+from google.auth.transport.requests import Request
+from google.oauth2 import service_account
 from icecream import ic
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from tqdm import tqdm
 
 
 load_dotenv()  # read local .env file
-client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
+MODEL = os.getenv("MODEL_NAME")
+GEMINI_URL = os.getenv("GEMINI_API_URL")
+IAM_FILE = os.getenv("IAM_PATH")
 MAX_TOKENS_PER_CHUNK = (
     1000  # if text is more than this many tokens, we'll break it up into
 )
-# discrete chunks to translate one chunk at a time
+OPENAI_URL = os.getenv("OPENAI_API_URL")
+OPENAI_KEY = os.getenv("OPENAI_API_KEY")
+
+API_INTERVEL_TIME = int(os.getenv("API_INTERVEL_TIME"))
+
+
+def load_credentials(filename):
+    with open(filename) as file:
+        credentials_info = json.load(file)
+    return credentials_info
+
+
+def store_token(auth_token, auth_time):
+    with open("asset/google_auth.json", "w") as file:
+        data = {
+            "auth_token": auth_token,
+            "auth_time": auth_time.astimezone(timezone.utc).isoformat(),
+        }
+        json.dump(data, file)
+
+
+def read_stored_token():
+    try:
+        with open("asset/google_auth.json") as file:
+            data: dict = json.load(file)
+            auth_token = data.get("auth_token")
+            auth_time = data.get("auth_time")
+            if auth_token and auth_time:
+                auth_time = datetime.fromisoformat(auth_time).astimezone(
+                    timezone.utc
+                )
+                return auth_token, auth_time
+    except FileNotFoundError:
+        pass
+    return None, None
+
+
+def get_access_token(credentials_info):
+    stored_token, stored_time = read_stored_token()
+    if (
+        stored_token
+        and stored_time
+        and (datetime.now(timezone.utc) < stored_time + timedelta(minutes=10))
+    ):
+        return stored_token
+
+    credentials = service_account.Credentials.from_service_account_info(
+        credentials_info,
+        scopes=["https://www.googleapis.com/auth/cloud-platform"],
+    )
+    request = Request()
+    credentials.refresh(request)
+    new_token = credentials.token
+    new_time = datetime.now(timezone.utc)
+    store_token(new_token, new_time)
+    for _ in range(240):
+        print(f"Token refreshed at {new_time}.", flush=True, end="\r")
+        time.sleep(1)
+    return new_token
+
+
+def call_api(url, access_token, data):
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+    }
+    max_retries = 10
+    wait_time = 60
+
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(url, headers=headers, json=data)
+            response.raise_for_status()  # Raise HTTPError for bad responses (4xx and 5xx)
+
+            try:
+                res = response.json()
+                return res
+            except Exception as e:
+                print(f"Error decoding JSON response: {e}\n{data}\n{res}")
+
+        except requests.exceptions.RequestException as e:
+            print(f"Request failed: {e}")
+
+        if attempt < max_retries - 1:
+            for remaining in range(wait_time, 0, -1):
+                print(
+                    f"Retrying in {remaining} seconds...", flush=True, end="\r"
+                )
+                time.sleep(1)
+            print("Retrying...                   ", flush=True)
+        else:
+            print("Exceeded maximum retries.")
+            sys.exit(1)
+
+
+def gemini_completion(prompt, system_message, temperature, model):
+    os.makedirs("asset", exist_ok=True)
+
+    credentials_info = load_credentials(IAM_FILE)
+
+    access_token = get_access_token(credentials_info)
+    api_url = GEMINI_URL + f"{model}:generateContent"
+    payload = {
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "systemInstruction": {
+            "role": "system",
+            "parts": [{"text": system_message}],
+        },
+        "generationConfig": {"temperature": temperature},
+    }
+    res = call_api(api_url, access_token, payload)
+    try:
+        answer = res["candidates"][0]["content"]["parts"][0]["text"]
+    except Exception as e:
+        print(
+            "unexpect output, most are judged to be in violation, you can remove related text and retry: \n",
+            e,
+        )
+        shutil.rmtree("cache")
+        sys.exit(1)
+    return answer
+
+
+def openai_completion(prompt, system_message, temperature, model):
+    data = {
+        "model": model,
+        "temperature": temperature,
+        "messages": [
+            {"role": "system", "content": system_message},
+            {"role": "user", "content": prompt},
+        ],
+        "stream": False,
+    }
+    res = call_api(OPENAI_URL, OPENAI_KEY, data)
+    answer = res["choices"][0]["message"]["content"]
+
+    return answer
 
 
 def get_completion(
     prompt: str,
     system_message: str = "You are a helpful assistant.",
-    model: str = "gpt-4-turbo",
+    model: str = MODEL,
     temperature: float = 0.3,
-    json_mode: bool = False,
-) -> Union[str, dict]:
-    """
-        Generate a completion using the OpenAI API.
-
-    Args:
-        prompt (str): The user's prompt or query.
-        system_message (str, optional): The system message to set the context for the assistant.
-            Defaults to "You are a helpful assistant.".
-        model (str, optional): The name of the OpenAI model to use for generating the completion.
-            Defaults to "gpt-4-turbo".
-        temperature (float, optional): The sampling temperature for controlling the randomness of the generated text.
-            Defaults to 0.3.
-        json_mode (bool, optional): Whether to return the response in JSON format.
-            Defaults to False.
-
-    Returns:
-        Union[str, dict]: The generated completion.
-            If json_mode is True, returns the complete API response as a dictionary.
-            If json_mode is False, returns the generated text as a string.
-    """
-
-    if json_mode:
-        response = client.chat.completions.create(
-            model=model,
+):
+    answer = ""
+    if "gemini" in model:
+        answer = gemini_completion(
+            prompt=prompt,
+            system_message=system_message,
             temperature=temperature,
-            top_p=1,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": system_message},
-                {"role": "user", "content": prompt},
-            ],
-        )
-        return response.choices[0].message.content
-    else:
-        response = client.chat.completions.create(
             model=model,
-            temperature=temperature,
-            top_p=1,
-            messages=[
-                {"role": "system", "content": system_message},
-                {"role": "user", "content": prompt},
-            ],
         )
-        return response.choices[0].message.content
+    elif "gpt" in model:
+        answer = openai_completion(
+            prompt=prompt,
+            system_message=system_message,
+            temperature=temperature,
+            model=model,
+        )
+    if API_INTERVEL_TIME > 0:
+        time.sleep(API_INTERVEL_TIME)
+    return answer
 
 
 def one_chunk_initial_translation(
@@ -328,16 +448,37 @@ To reiterate, you should translate only this part of the text, shown here again 
 
 Output only the translation of the portion you are asked to translate, and nothing else.
 """
-
+    done_idx = 0
     translation_chunks = []
-    for i in range(len(source_text_chunks)):
+
+    cache_file = "cache/init_translation.json"
+    if os.path.exists(cache_file):
+        with open(cache_file, encoding="utf-8") as f:
+            cache_data: dict = json.load(f)
+            done_idx = cache_data.get("done_idx", 0)
+            translation_chunks = cache_data.get("translation_chunks", [])
+
+    if done_idx == len(source_text_chunks) - 1:
+        return translation_chunks
+
+    for i in tqdm(
+        range(done_idx, len(source_text_chunks)), desc="1:init translating"
+    ):
         # Will translate chunk i
         tagged_text = (
-            "".join(source_text_chunks[0:i])
+            "".join(source_text_chunks[max(i - 2, 0) : i])
+            if i > 0
+            else ""
             + "<TRANSLATE_THIS>"
             + source_text_chunks[i]
             + "</TRANSLATE_THIS>"
-            + "".join(source_text_chunks[i + 1 :])
+            + "".join(
+                source_text_chunks[
+                    i + 1 : min(i + 2, len(source_text_chunks) - 1)
+                ]
+            )
+            if i < len(source_text_chunks) - 1
+            else ""
         )
 
         prompt = translation_prompt.format(
@@ -349,6 +490,13 @@ Output only the translation of the portion you are asked to translate, and nothi
 
         translation = get_completion(prompt, system_message=system_message)
         translation_chunks.append(translation)
+        done_idx = i
+        cache_data = {
+            "done_idx": done_idx,
+            "translation_chunks": translation_chunks,
+        }
+        with open(cache_file, "w", encoding="utf-8") as f:
+            json.dump(cache_data, f, ensure_ascii=False, indent=4)
 
     return translation_chunks
 
@@ -440,15 +588,37 @@ Write a list of specific, helpful and constructive suggestions for improving the
 Each suggestion should address one specific part of the translation.
 Output only the suggestions and nothing else."""
 
+    done_idx = 0
     reflection_chunks = []
-    for i in range(len(source_text_chunks)):
+
+    cache_file = "cache/reflection_chunks.json"
+    if os.path.exists(cache_file):
+        with open(cache_file, encoding="utf-8") as f:
+            cache_data: dict = json.load(f)
+            done_idx = cache_data.get("done_idx", 0)
+            reflection_chunks = cache_data.get("reflection_chunks", [])
+
+    if done_idx == len(source_text_chunks) - 1:
+        return reflection_chunks
+
+    for i in tqdm(
+        range(done_idx, len(source_text_chunks)), desc="2:reflect translating"
+    ):
         # Will translate chunk i
         tagged_text = (
-            "".join(source_text_chunks[0:i])
+            "".join(source_text_chunks[max(i - 2, 0) : i])
+            if i > 0
+            else ""
             + "<TRANSLATE_THIS>"
             + source_text_chunks[i]
             + "</TRANSLATE_THIS>"
-            + "".join(source_text_chunks[i + 1 :])
+            + "".join(
+                source_text_chunks[
+                    i + 1 : min(i + 2, len(source_text_chunks) - 1)
+                ]
+            )
+            if i < len(source_text_chunks) - 1
+            else ""
         )
         if country != "":
             prompt = reflection_prompt.format(
@@ -470,6 +640,13 @@ Output only the suggestions and nothing else."""
 
         reflection = get_completion(prompt, system_message=system_message)
         reflection_chunks.append(reflection)
+        done_idx = i
+        cache_data = {
+            "done_idx": done_idx,
+            "reflection_chunks": reflection_chunks,
+        }
+        with open(cache_file, "w", encoding="utf-8") as f:
+            json.dump(cache_data, f, ensure_ascii=False, indent=4)
 
     return reflection_chunks
 
@@ -534,15 +711,37 @@ to whether there are ways to improve the translation's
 
 Output only the new translation of the indicated part and nothing else."""
 
+    done_idx = 0
     translation_2_chunks = []
-    for i in range(len(source_text_chunks)):
+
+    cache_file = "cache/imporove_chunks.json"
+    if os.path.exists(cache_file):
+        with open(cache_file, encoding="utf-8") as f:
+            cache_data: dict = json.load(f)
+            done_idx = cache_data.get("done_idx", 0)
+            translation_2_chunks = cache_data.get("translation_2_chunks", [])
+
+    if done_idx == len(source_text_chunks) - 1:
+        return translation_2_chunks
+
+    for i in tqdm(
+        range(done_idx, len(source_text_chunks)), desc="3:improve translating"
+    ):
         # Will translate chunk i
         tagged_text = (
-            "".join(source_text_chunks[0:i])
+            "".join(source_text_chunks[max(i - 2, 0) : i])
+            if i > 0
+            else ""
             + "<TRANSLATE_THIS>"
             + source_text_chunks[i]
             + "</TRANSLATE_THIS>"
-            + "".join(source_text_chunks[i + 1 :])
+            + "".join(
+                source_text_chunks[
+                    i + 1 : min(i + 2, len(source_text_chunks) - 1)
+                ]
+            )
+            if i < len(source_text_chunks) - 1
+            else ""
         )
 
         prompt = improvement_prompt.format(
@@ -556,6 +755,13 @@ Output only the new translation of the indicated part and nothing else."""
 
         translation_2 = get_completion(prompt, system_message=system_message)
         translation_2_chunks.append(translation_2)
+        done_idx = i
+        cache_data = {
+            "done_idx": done_idx,
+            "translation_2_chunks": translation_2_chunks,
+        }
+        with open(cache_file, "w", encoding="utf-8") as f:
+            json.dump(cache_data, f, ensure_ascii=False, indent=4)
 
     return translation_2_chunks
 
@@ -664,12 +870,13 @@ def translate(
         return final_translation
 
     else:
+        os.makedirs("cache", exist_ok=True)
+
         ic("Translating text as multiple chunks")
 
         token_size = calculate_chunk_size(
             token_count=num_tokens_in_text, token_limit=max_tokens
         )
-
         ic(token_size)
 
         text_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
@@ -683,5 +890,5 @@ def translate(
         translation_2_chunks = multichunk_translation(
             source_lang, target_lang, source_text_chunks, country
         )
-
+        shutil.rmtree("cache")
         return "".join(translation_2_chunks)
