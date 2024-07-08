@@ -1014,7 +1014,7 @@ def calculate_chunk_size(token_count: int, token_limit: int) -> int:
     return chunk_size
 
 def replace_markdown_links(text):
-    # 正则表达式匹配 [![.*?](.*?)] 的模式
+    # 正则表达式匹配 [![.*?](.*?)](.*?) 的模式
     pattern = re.compile(r'\[(!\[.*?\]\(.*?\))\]\(.*?\)')
     replaced_text = pattern.sub(r'\1', text)
     
