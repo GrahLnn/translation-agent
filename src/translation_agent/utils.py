@@ -36,6 +36,8 @@ GEMINI_KEYS = list(map(str.strip, os.getenv("GEMINI_API_KEY").split(",")))
 API_INTERVEL_TIME = int(os.getenv("API_INTERVEL_TIME"))
 SAVE_CACHE = os.getenv("SAVE_CACHE") == "True"
 filename = ""
+textname = ""
+
 
 def load_credentials(filename):
     with open(filename) as file:
@@ -242,6 +244,24 @@ def gemini_completion(prompt, system_message, temperature, model, key, limit):
             "parts": [{"text": system_message}],
         },
         "generationConfig": {"temperature": temperature},
+        "safetySettings": [
+            {
+                "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                "threshold": "BLOCK_NONE",
+            },
+            {
+                "category": "HARM_CATEGORY_HATE_SPEECH",
+                "threshold": "BLOCK_NONE",
+            },
+            {
+                "category": "HARM_CATEGORY_HARASSMENT",
+                "threshold": "BLOCK_NONE",
+            },
+            {
+                "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+                "threshold": "BLOCK_NONE",
+            },
+        ],
     }
     if USE_VERTEX:
         api_url = VERTEX_URL + f"{model}:generateContent"
@@ -258,6 +278,8 @@ def gemini_completion(prompt, system_message, temperature, model, key, limit):
         print(
             "unexpect output, most are judged to be in violation, you can remove related text and retry, related prompt bellow: \n------prompt------\n",
             prompt,
+            "\n------result------\n",
+            res,
         )
         sys.exit(1)
     return answer
@@ -284,7 +306,7 @@ def get_completion(
     system_message: str = "You are a helpful assistant.",
     model: str = MODEL,
     temperature: float = 0.3,
-):
+) -> str:
     answer = ""
     if "gemini" in model:
         key, limit = choose_key()
@@ -549,20 +571,18 @@ def multichunk_initial_translation(
 
     system_message = f"You are an expert linguist, specializing in translation from {source_lang} to {target_lang}."
 
-    translation_prompt = """Your task is provide a professional translation from {source_lang} to {target_lang} of PART of a text.
+    translation_prompt = """Your task is to provide a professional translation from {source_lang} to {target_lang} of PART of a text.
 
-The source text is below, delimited by XML tags <SOURCE_TEXT> and </SOURCE_TEXT>. Translate only the part within the source text
-delimited by <TRANSLATE_THIS> and </TRANSLATE_THIS>. You can use the rest of the source text as context, but do not translate any
-of the other text. Do not output anything other than the translation of the indicated part of the text. Retain all markdown image links, Latex code and multi-level title in their positions and relationships within the text.
-
-<SOURCE_TEXT>
-{tagged_text}
-</SOURCE_TEXT>
-
-To reiterate, you should translate only this part of the text, shown here again between <TRANSLATE_THIS> and </TRANSLATE_THIS>:
+To reiterate, you should translate only this part and ALL from this of the text, shown here between <TRANSLATE_THIS> and </TRANSLATE_THIS>:
 <TRANSLATE_THIS>
 {chunk_to_translate}
 </TRANSLATE_THIS>
+
+Guidelines for translate:
+1. Translate ALL content between <TRANSLATE_THIS> and </TRANSLATE_THIS> part.
+2. Maintain paragraph structure and line breaks.
+3. Preserve all markdown, image links, LaTeX code, and titles.
+4. Do not remove any single line from the <TRANSLATE_THIS> and </TRANSLATE_THIS> part.
 
 Output only the translation of the portion you are asked to translate, and nothing else.
 """
@@ -582,7 +602,6 @@ Output only the translation of the portion you are asked to translate, and nothi
     for i in tqdm(
         range(done_idx + 1, len(source_text_chunks)), desc="1:init translating"
     ):
-        # Will translate chunk i
         tagged_text = (
             ("".join(source_text_chunks[max(i - 2, 0) : i]) if i > 0 else "")
             + "<TRANSLATE_THIS>"
@@ -598,15 +617,25 @@ Output only the translation of the portion you are asked to translate, and nothi
                 else ""
             )
         )
-
         prompt = translation_prompt.format(
             source_lang=source_lang,
             target_lang=target_lang,
-            tagged_text=tagged_text,
             chunk_to_translate=source_text_chunks[i],
         )
 
         translation = get_completion(prompt, system_message=system_message)
+        translation = (
+            translation.replace("<TRANSLATION>", "")
+            .replace("</TRANSLATION>", "")
+            .replace("</TRANSLATE_THIS>", "")
+            .replace("<TRANSLATE_THIS>", "")
+            .strip()
+        )
+        print(
+            "\n",
+            len(source_text_chunks[i].split("\n\n"))
+            - len(translation.split("\n\n"))
+        )
         translation_chunks.append(translation)
 
         cache_data = {
@@ -618,17 +647,21 @@ Output only the translation of the portion you are asked to translate, and nothi
 
         if SAVE_CACHE:
             save_cache(
-                f"saved_cache/{MODEL}/chunk_{i}/",
+                f"saved_cache/{textname}/{MODEL}/chunk_{i}/",
                 source_text_chunks[i],
                 "source_t",
             )
             save_cache(
-                f"saved_cache/{MODEL}/chunk_{i}/", translation, f"init_t_{i}"
+                f"saved_cache/{textname}/{MODEL}/chunk_{i}/",
+                translation,
+                f"init_t_{i}",
             )
 
     if SAVE_CACHE:
         save_cache(
-            f"saved_cache/{MODEL}/", "".join(translation_chunks), "init_t"
+            f"saved_cache/{textname}/{MODEL}/",
+            "".join(translation_chunks),
+            "init_t",
         )
     return translation_chunks
 
@@ -780,14 +813,16 @@ Output only the suggestions and nothing else."""
             json.dump(cache_data, f, ensure_ascii=False, indent=4)
         if SAVE_CACHE:
             save_cache(
-                f"saved_cache/{MODEL}/chunk_{i}/",
+                f"saved_cache/{textname}/{MODEL}/chunk_{i}/",
                 reflection,
                 f"reflection_t_{i}",
             )
 
     if SAVE_CACHE:
         save_cache(
-            f"saved_cache/{MODEL}/", "".join(reflection_chunks), "reflection_t"
+            f"saved_cache/{textname}/{MODEL}/",
+            "".join(reflection_chunks),
+            "reflection_t",
         )
 
     return reflection_chunks
@@ -816,51 +851,37 @@ def multichunk_improve_translation(
 
     system_message = f"You are an expert linguist, specializing in translation editing from {source_lang} to {target_lang}."
 
-    improvement_prompt = """Your task is to carefully read, then improve, a translation from {source_lang} to {target_lang}, taking into
-account a set of expert suggestions and constructive criticisms. Below, the source text, initial translation, and expert suggestions are provided.
-
-The source text is below, delimited by XML tags <SOURCE_TEXT> and </SOURCE_TEXT>, and the part that has been translated
-is delimited by <TRANSLATE_THIS> and </TRANSLATE_THIS> within the source text. You can use the rest of the source text as context, but need to provide a translation only of the part indicated by <TRANSLATE_THIS> and </TRANSLATE_THIS>. Retain all markdown image links, Latex code and title in their positions and relationships within the text.
+    improvement_prompt = """Improve the translation from {source_lang} to {target_lang} based on expert suggestions. Use the provided source text and initial translation as reference.
 
 <SOURCE_TEXT>
 {tagged_text}
 </SOURCE_TEXT>
 
-To reiterate, only part of the text is being translated, shown here again between <TRANSLATE_THIS> and </TRANSLATE_THIS>:
+Translate only the part within <TRANSLATE_THIS> tags:
 <TRANSLATE_THIS>
 {chunk_to_translate}
 </TRANSLATE_THIS>
 
-The initial translation of the indicated part, delimited below by <TRANSLATION> and </TRANSLATION>, is as follows:
+Initial translation:
 <TRANSLATION>
 {translation_1_chunk}
 </TRANSLATION>
 
-The expert suggestions for improving the translation, delimited below by <EXPERT_SUGGESTIONS> and </EXPERT_SUGGESTIONS>, are as follows:
+Expert suggestions:
 <EXPERT_SUGGESTIONS>
 {reflection_chunk}
+- Even if it is a single title or a title containing incomplete paragraphs, it still needs to be translated.
 </EXPERT_SUGGESTIONS>
 
-Your task is to improve the initial translation while maintaining its overall structure and completeness. Please follow these guidelines:
+Guidelines for improvement:
+1. Cover ALL paragraph and infomation from the part within <TRANSLATE_THIS> tags.
+2. Maintain ALL paragraph structure and line breaks, and titles.
+3. Preserve all markdown, image links, LaTeX code, and titles.
+4. Prioritize completeness over conflicting expert suggestions.
+5. Do not remove any single line from the part within <TRANSLATE_THIS> tags.
+6. All initial translation content should be included in the final translation!
 
-1. Ensure that your improved translation covers ALL the content present in the initial translation. Do not omit any sentences or sections.
-
-2. Maintain the same paragraph structure and line breaks as the initial translation.
-
-3. Retain all markdown formatting, image links, LaTeX code, and titles in their original positions.
-
-4. Focus on improving the translation in the following aspects:
-   a) Accuracy: Correct any errors of addition, mistranslation, omission, or untranslated text. Ensure content consistency.
-   b) Fluency: Apply proper {target_lang} grammar, spelling, and punctuation rules. Eliminate unnecessary repetitions.
-   c) Style: Ensure the translation reflects the style of the source text.
-   d) Terminology: Use appropriate and consistent terminology for the context.
-   e) Other errors: Address any other issues you identify.
-
-5. If the expert suggestions contradict maintaining the structure or completeness of the initial translation, prioritize keeping the full content and structure.
-
-6. Your output should be a complete, improved version of the entire <TRANSLATION> section, with all its original content accounted for and enhanced where possible.
-
-Output only the new, improved translation of the indicated part and nothing else. Ensure that your output is at least as long as the initial translation and covers all the same content.
+Output only the new translation of the indicated part and nothing else.
 """
 
     done_idx = -1
@@ -918,14 +939,19 @@ Output only the new, improved translation of the indicated part and nothing else
 
         if SAVE_CACHE:
             save_cache(
-                f"saved_cache/{MODEL}/chunk_{i}/",
+                f"saved_cache/{textname}/{MODEL}/chunk_{i}/",
                 translation_2,
                 f"improvition_t_{i}",
             )
+        print("\n", len(translation_2) - len(translation_1_chunks[i]))
+        print(
+            len(translation_2.split("\n\n"))
+            - len(translation_1_chunks[i].split("\n\n"))
+        )
 
     if SAVE_CACHE:
         save_cache(
-            f"saved_cache/{MODEL}/",
+            f"saved_cache/{textname}/{MODEL}/",
             "".join(translation_2_chunks),
             "improvition_t",
         )
@@ -1013,20 +1039,25 @@ def calculate_chunk_size(token_count: int, token_limit: int) -> int:
 
     return chunk_size
 
+
 def replace_markdown_links(text):
     # 正则表达式匹配 [![.*?](.*?)](.*?) 的模式
-    pattern = re.compile(r'\[(!\[.*?\]\(.*?\))\]\(.*?\)')
-    replaced_text = pattern.sub(r'\1', text)
-    
+    pattern = re.compile(r"\[(!\[.*?\]\(.*?\))\]\(.*?\)")
+    replaced_text = pattern.sub(r"\1", text)
+
     return replaced_text
+
 
 def translate(
     source_lang,
     target_lang,
     source_text,
     country,
+    curfile,
     max_tokens=MAX_TOKENS_PER_CHUNK,
 ):
+    global textname
+    textname = curfile
     """Translate the source_text from source_lang to target_lang."""
     source_text = replace_markdown_links(source_text)
     num_tokens_in_text = num_tokens_in_string(source_text)
@@ -1048,7 +1079,9 @@ def translate(
 
         ic("Translating text as multiple chunks")
         if SAVE_CACHE:
-            save_cache(f"saved_cache/{MODEL}/", source_text, "source_text")
+            save_cache(
+                f"saved_cache/{textname}/{MODEL}/", source_text, "source_text"
+            )
         token_size = calculate_chunk_size(
             token_count=num_tokens_in_text, token_limit=max_tokens
         )

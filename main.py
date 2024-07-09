@@ -24,6 +24,7 @@ for filename in os.listdir(text_folder):
         target_lang=target_lang,
         source_text=source_text,
         country=country,
+        curfile=filename,
     )
     translation = (
         translation.replace("<TRANSLATION>", "")
@@ -38,5 +39,8 @@ for filename in os.listdir(text_folder):
     # 将翻译结果写入输出文件
     with open(translation_output_path, "w", encoding="utf-8") as output_file:
         output_file.write(translation)
+        
+    # 删除源文本
+    os.remove(text_file_path)
 
     print(f"Translation has been written to {translation_output_path}")
